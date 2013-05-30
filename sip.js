@@ -4,123 +4,6 @@ var dns = require('dns');
 var assert = require('assert');
 var dgram = require('dgram');
 
-var v05 = !(process.version < 'v0.5.0');
-
-//Various utility stuff
-
-if(!v05) {
-//node.js 'dgram' module do not allow proper ICMP errors handling
-var udp = (function() {
-  var events = require('events');
-
-  try {
-    var IOWatcher    = process.binding('io_watcher').IOWatcher;
-  } 
-  catch(e) {
-    var IOWatcher    = process.IOWatcher;
-  }
-  var binding      = process.binding('net');
-  var socket       = binding.socket;
-  var recvfrom     = binding.recvfrom;
-  var close        = binding.close;
-
-  var pool = null;
-
-  function getPool() {
-    var minPoolAvail = 1024 * 8;
-
-    var poolSize = 1024 * 64;
-
-    if (pool === null || (pool.used + minPoolAvail  > pool.length)) {
-      pool = new Buffer(poolSize);
-      pool.used = 0;
-    }
-
-    return pool;
-  }
-
-  function Socket(listener) {
-    events.EventEmitter.call(this);
-    var self = this;
-    self.fd = socket('udp4');
-
-    if(typeof listener === 'function')
-      self.on('message', listener);
-
-    self.watcher = new IOWatcher();
-    self.watcher.host = self;
-    self.watcher.callback = function() {
-      try {
-        while(self.fd) {
-          var p = getPool();
-          var rinfo = recvfrom(self.fd, p, p.used, p.length-p.used, 0);
-       
-          if(!rinfo) return;
-
-          self.emit('message', p.slice(p.used, p.used + rinfo.size), rinfo);
-
-          p.used += rinfo.size;
-        }
-      }
-      catch(e) {
-        self.emit('error', e);
-      } 
-    };
-
-    self.watcher.set(this.fd, true, false); 
-    self.watcher.start(); 
-  }
-
-  util.inherits(Socket, events.EventEmitter); 
-
-  Socket.prototype.bind = function(port, address) {
-    binding.bind(this.fd, port, address);
-    this.emit('listening');
-  }
-
-  Socket.prototype.connect = function(port, address) {
-    binding.connect(this.fd, port, address);
-  }
-
-  Socket.prototype.address = function () {
-    return binding.getsockname(this.fd);
-  };
-
-  Socket.prototype.send = function(buffer, offset, length, callback) {
-    if (typeof offset !== "number" || typeof length !== "number") {
-      throw new Error("send takes offset and length as args 2 and 3");
-    }
-
-    try {
-      var bytes = binding.sendMsg(this.fd, buffer, offset, length);
-    }
-    catch(err) {
-      if (callback) {
-        callback(err);
-      }
-      return;
-    }
- 
-    if(callback) {
-      callback(null, bytes);
-    }
-  };
-
-  Socket.prototype.close = function () {
-    if (!this.fd) throw new Error('Not running');
-
-    this.watcher.stop();
-
-    close(this.fd);
-    this.fd = null;
-
-    this.emit("close");
-  };
-
-  return { createSocket: function(listener) { return new Socket(listener); } };
-})();
-}
-
 function debug(e) {
   if(e.stack) {
     util.debug(e + '\n' + e.stack);
@@ -328,6 +211,15 @@ function stringifyVersion(v) {
   return v || '2.0';
 }
 
+function stringifyParams(params) {
+  var s = '';
+  for(var n in params) {
+      s += ';'+n+(params[n]?'='+params[n]:'');
+  }
+
+  return s;
+}
+
 function stringifyUri(uri) {
   if(typeof uri === 'string')
     return uri;
@@ -347,7 +239,7 @@ function stringifyUri(uri) {
     s += ':' + uri.port;
 
   if(uri.params)
-    s += Object.keys(uri.params).map(function(x){return ';'+x+(uri.params[x] ? '='+uri.params[x] : '');}).join('');
+    s += stringifyParams(uri.params);
 
   if(uri.headers) {
     var h = Object.keys(uri.headers).map(function(x){return x+'='+uri.headers[x];}).join('&');
@@ -358,15 +250,6 @@ function stringifyUri(uri) {
 }
 
 exports.stringifyUri = stringifyUri;
-
-function stringifyParams(params) {
-  var s = '';
-  for(var n in params) {
-      s += ';'+n+(params[n]?'='+params[n]:'');
-  }
-
-  return s;
-}
 
 function stringifyAOR(aor) {
   return (aor.name || '') + ' <' + stringifyUri(aor.uri) + '>'+stringifyParams(aor.params); 
@@ -561,6 +444,17 @@ function parseMessage(s) {
 }
 exports.parse = parseMessage;
 
+function checkMessage(msg) {
+  return (msg.method || (msg.status >= 100 && msg.status <= 999)) &&
+    msg.headers &&
+    Array.isArray(msg.headers.via) &&
+    msg.headers.via.length > 0 &&
+    msg.headers['call-id'] &&
+    msg.headers.to &&
+    msg.headers.from &&
+    msg.headers.cseq;
+}
+
 function makeTcpTransport(options, callback) {
   var connections = Object.create(null);
 
@@ -587,8 +481,10 @@ function makeTcpTransport(options, callback) {
     stream.setEncoding('ascii');
 
     stream.on('data', makeStreamParser(function(m) { 
-      if(m.method) m.headers.via[0].params.received = remote.address;
-      callback(m, remote); 
+      if(checkMessage(m)) {
+        if(m.method) m.headers.via[0].params.received = remote.address;
+        callback(m, remote);
+      }
     }));
 
     stream.on('close',    function() { delete connections[id]; });
@@ -642,11 +538,11 @@ function makeTcpTransport(options, callback) {
   }
 }
 
-function makeUdpTransport_V0_5(options, callback) {
+function makeUdpTransport(options, callback) {
   function onMessage(data, rinfo) {
     var msg = parseMessage(data);
     
-    if(msg) {
+    if(msg && checkMessage(msg)) {
       if(msg.method) {
         msg.headers.via[0].params.received = rinfo.address;
         if(msg.headers.via[0].params.hasOwnProperty('rport'))
@@ -657,8 +553,11 @@ function makeUdpTransport_V0_5(options, callback) {
     }
   }
 
+  var address = options.address || '0.0.0.0';
+  var port = options.port || 5060;
+
   var socket = dgram.createSocket(net.isIPv6(options.address) ? 'udp6' : 'udp4', onMessage); 
-  socket.bind(options.port || 5060, options.address);
+  socket.bind(port, address);
 
   return {
     open: function(remote, error) {
@@ -667,86 +566,13 @@ function makeUdpTransport_V0_5(options, callback) {
           var s = stringify(m);
           socket.send(new Buffer(s, 'ascii'), 0, s.length, remote.port, remote.address);          
         },
-        local: {protocol: 'UDP', address: socket.address().address, port: socket.address().port},
+        local: {protocol: 'UDP', address: address, port: port},
         release : function() {}
       }; 
     },
     destroy: function() { socket.close(); }
   }
 }
-
-function makeUdpTransport_pre_V0_5(options, callback) {
-  var connections = Object.create(null);
-
-  function listener(data, rinfo) {
-    var msg = parseMessage(data);
-
-    if(msg) {
-      if(msg.method) {
-        msg.headers.via[0].params.received = rinfo.address;
-        if(msg.headers.via[0].params.hasOwnProperty('rport'))
-          msg.headers.via[0].params.rport = rinfo.port;
-      }
-    
-      callback(msg, {protocol: 'UDP', address: rinfo.address, port: rinfo.port});
-    }
-  };
-
-  var socket = udp.createSocket(listener);
-
-  socket.bind(options.port || 5060, options.address);
-  socket.on('error', function() {});
-  
-  function open(remote) {
-    var socket = udp.createSocket(listener),
-        id = [remote.address, remote.port].join(),
-        local,
-        refs = 0,
-        timeout;
-    
-    socket.bind(options.port || 5060, options.address);
-    socket.connect(remote.port, remote.address);
-    
-    local = {protocol: 'UDP', address: socket.address().address, port: socket.address().port};
-    
-    socket.on('error', function() {});
-    socket.on('close', function() { delete connections[id]; });
-
-    return connections[id] = function(onError) {
-      ++refs;
-      
-      if(timeout) {
-        clearTimeout(timeout);
-        timeout = null;
-      }
-
-      if(onError) socket.on('error', onError);
-
-      return { 
-        send: function(m) {
-          var s = stringify(m);
-          socket.send(new Buffer(s, 'ascii'), 0, s.length);
-        },
-        release: function() { 
-          if(onError) socket.removeListener('error', onError);
-          
-          if(--refs === 0)
-            timeout = setTimeout(socket.close.bind(socket), 30000);
-        },
-        local: local
-      };
-    };
-  };
- 
-  return {
-    open: function(remote, error) { 
-      return (connections[[remote.address, remote.port].join()] || open(remote))(error);
-    },
-    destroy: function() { socket.close(); }
-  };
-}
-
-var makeUdpTransport = v05 ? makeUdpTransport_V0_5 : makeUdpTransport_pre_V0_5; 
 
 function makeTransport(options, callback) {
   var protocols = {};
@@ -767,7 +593,7 @@ function makeTransport(options, callback) {
   function wrap(obj, target) {
     return Object.create(obj, {send: {value: function(m) {
       if(m.method) {
-        m.headers.via[0].host = this.local.address;
+        m.headers.via[0].host = options.publicAddress || this.local.address;
         m.headers.via[0].port = options.port || 5060;
         m.headers.via[0].protocol = this.local.protocol;
 
@@ -798,7 +624,9 @@ function makeTransport(options, callback) {
       }
     },
     destroy: function() { 
-      Object.keys(protocols).forEach(function(key) { protocols[key].destroy(); });
+      var protos = protocols;
+      protocols = [];
+      Object.keys(protos).forEach(function(key) { protos[key].destroy(); });
     },
   };
 }
@@ -812,7 +640,7 @@ function resolve(uri, action) {
   function resolve46(host, cb) {
     dns.resolve4(host, function(e4, a4) {
       dns.resolve6(host, function(e6, a6) {
-        if((a4 || a6).length)
+        if((a4 || a6) && (a4 || a6).length)
           cb(null, a4.concat(a6));
         else
           cb(e4 || e6, []);
@@ -823,7 +651,7 @@ function resolve(uri, action) {
   if(uri.port) {
     var protocols = uri.params.protocol ? [uri.params.protocol] : ['UDP', 'TCP'];
     
-    resolve46(uri.host, function(err, address4) {
+    resolve46(uri.host, function(err, address) {
       address = (address || []).map(function(x) { return protocols.map(function(p) { return { protocol: p, address: x, port: uri.port || 5060};});})
         .reduce(function(arr,v) { return arr.concat(v); }, []);
         action(address);
@@ -915,7 +743,7 @@ function createInviteServerTransaction(transport, cleanup) {
   var completed = {
     enter: function () {
       g = setTimeout(function retry(t) { 
-        setTimeout(retry, t*2, t*2);
+        g = setTimeout(retry, t*2, t*2);
         transport(rs)
       }, 500, 500);
       h = setTimeout(sm.enter.bind(sm, terminated), 32000);
@@ -931,11 +759,17 @@ function createInviteServerTransaction(transport, cleanup) {
         transport(rs);
     }
   }
-  
-  var confirmed = {enter: function() { setTimeout(sm.enter.bind(sm, terminated), 5000);} };
+ 
+  var timer_i; 
+  var confirmed = {
+    enter: function() { timer_i = setTimeout(sm.enter.bind(sm, terminated), 5000);},
+    leave: function() { clearTimeout(timer_i); }
+  };
 
+  var l;
   var accepted = {
-    enter: function() { setTimeout(sm.enter.bind(sm, terminated), 32000);},
+    enter: function() { l = setTimeout(sm.enter.bind(sm, terminated), 32000);},
+    leave: function() { clearTimeout(l); },
     send: function(m) { 
       rs = m;
       transport(rs);
@@ -946,7 +780,7 @@ function createInviteServerTransaction(transport, cleanup) {
   
   sm.enter(proceeding);
 
-  return {send: sm.signal.bind(sm, 'send'), message: sm.signal.bind(sm,'message')};
+  return {send: sm.signal.bind(sm, 'send'), message: sm.signal.bind(sm,'message'), shutdown: function() { sm.enter(terminated); }};
 }
 
 function createServerTransaction(transport, cleanup) {
@@ -962,17 +796,21 @@ function createServerTransaction(transport, cleanup) {
     }
   }; 
 
+  var j;
   var completed = {
     message: function() { transport(rs); },
-    enter: function() { setTimeout(cleanup, 32000); }
+    enter: function() { j = setTimeout(function() { sm.enter(terminated); }, 32000); },
+    leave: function() { clearTimeout(j); }
   };
+
+  var terminated = {enter: cleanup};
 
   sm.enter(trying);
 
-  return {send: sm.signal.bind(sm, 'send'), message: sm.signal.bind(sm, 'message')};
+  return {send: sm.signal.bind(sm, 'send'), message: sm.signal.bind(sm, 'message'), shutdown: function() { sm.enter(terminated); }};
 }
 
-function createInviteClientTransaction(rq, transport, tu, cleanup) {
+function createInviteClientTransaction(rq, transport, tu, cleanup, options) {
   var sm = makeSM();
 
   var a, b;
@@ -1026,25 +864,30 @@ function createInviteClientTransaction(rq, transport, tu, cleanup) {
       from: rq.headers.from,
       cseq: {method: 'ACK', seq: rq.headers.cseq.seq},
       'call-id': rq.headers['call-id'],
-      via: [rq.headers.via[0]]
+      via: [rq.headers.via[0]],
+      'max-forwards': (options && options['max-forwards']) || 70 
     }
   };
 
+  var d;
   var completed = {
     enter: function(rs) {
       ack.headers.to=rs.headers.to;
       transport(ack);
-      setTimeout(sm.enter.bind(sm, terminated), 32000);
+      d = setTimeout(sm.enter.bind(sm, terminated), 32000);
     },
+    leave: function() { clearTimeout(d); },
     message: function(message, remote) {
       if(remote) transport(ack);  // we don't want to ack internally generated messages
     }
   };
 
+  var timer_m;
   var accepted = {
     enter: function() {
-      setTimeout(function() { sm.enter(terminated); }, 32000);
+      timer_m = setTimeout(function() { sm.enter(terminated); }, 32000);
     },
+    leave: function() { clearTimeout(timer_m); },
     message: function(m) {
       if(m.status >= 200 && m.status <= 299)
         tu(m);
@@ -1055,7 +898,7 @@ function createInviteClientTransaction(rq, transport, tu, cleanup) {
  
   sm.enter(calling);
  
-  return {message: sm.signal.bind(sm, 'message')};
+  return {message: sm.signal.bind(sm, 'message'), shutdown: function() { sm.enter(terminated); }};
 }
 
 function createClientTransaction(rq, transport, tu, cleanup) {  
@@ -1100,13 +943,17 @@ function createClientTransaction(rq, transport, tu, cleanup) {
     }
   };
 
-  var completed = {enter: function () { setTimeout(function() { sm.enter(terminated); }, 5000); } };
+  var k;
+  var completed = {
+    enter: function() { k = setTimeout(function() { sm.enter(terminated); }, 5000); },
+    leave: function() { clearTimeout(k); }
+  };
 
   var terminated = {enter: cleanup};
 
   sm.enter(trying);
 
-  return {message: sm.signal.bind(sm, 'message')};
+  return {message: sm.signal.bind(sm, 'message'), shutdown: function() { sm.enter(terminated); }};
 }
 
 function makeTransactionId(m) {
@@ -1182,9 +1029,10 @@ function makeTransactionLayer(options, transport) {
               send.reliable = cn.local.protocol.toUpperCase() !== 'UDP';
 
               client_transactions[id] = transaction(rq, send, onresponse, function() { 
-                delete client_transactions[id];
-                cn.release();
-              });
+                  delete client_transactions[id];
+                  cn.release();
+                }, 
+                options);
             }
             catch(e) {
               onresponse(makeResponse(rq, 503));  
@@ -1211,6 +1059,10 @@ function makeTransactionLayer(options, transport) {
     },
     getClient: function(m) {
       return client_transactions[makeTransactionId(m)];
+    },
+    destroy: function() {
+      Object.keys(client_transactions).forEach(function(x) { client_transactions[x].shutdown(); });
+      Object.keys(server_transactions).forEach(function(x) { server_transactions[x].shutdown(); });
     }
   };
 }
@@ -1264,7 +1116,7 @@ exports.create = function(options, callback) {
           
           resolve(getNextHop(m), function(address) {
             if(address.length === 0) {
-              errorLog(new Error("ACK: couldn't resove" + stringifyUri(m.uri)));
+              errorLog(new Error("ACK: couldn't resolve " + stringifyUri(m.uri)));
               return;
             }
           
@@ -1285,7 +1137,10 @@ exports.create = function(options, callback) {
         }
       }
     },
-    destroy: transport.destroy.bind(transport)
+    destroy: function() {
+      transaction.destroy();
+      transport.destroy();
+    }
   } 
 }
 
